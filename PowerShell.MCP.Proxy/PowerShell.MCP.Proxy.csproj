@@ -1,0 +1,71 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <!-- Pin bundled runtime pack to patched version (Dependabot CVE-2026-62899/62901) -->
+    <RuntimeFrameworkVersion>9.0.19</RuntimeFrameworkVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Version>1.14.2.0</Version>
+    <NoWarn>$(NoWarn);NETSDK1206</NoWarn>
+
+    <!-- Single-file deployment settings -->
+    <PublishSingleFile>true</PublishSingleFile>
+
+    <!-- File-size optimization settings -->
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>full</TrimMode>
+    <PublishReadyToRun>false</PublishReadyToRun>
+
+    <!-- Performance optimization -->
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>embedded</DebugType>
+
+    <!-- Suppress warnings (trimming-related) -->
+    <SuppressTrimAnalysisWarnings>false</SuppressTrimAnalysisWarnings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PowerShell.MCP.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- MCP SDK -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.9" />
+    <PackageReference Include="ModelContextProtocol" Version="1.1.0" />
+    <!-- Minimal dependency-injection set -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.9" />
+  </ItemGroup>
+
+  <!-- Trimming settings: protect required assemblies -->
+  <ItemGroup>
+    <TrimmerRootAssembly Include="PowerShell.MCP.Proxy" />
+    <TrimmerRootAssembly Include="ModelContextProtocol" />
+    <TrimmerRootAssembly Include="ModelContextProtocol.Core" />
+  </ItemGroup>
+
+  <!-- Resource file settings -->
+  <ItemGroup>
+    <EmbeddedResource Update="Resources\**\*.resx">
+      <Generator>ResXFileCodeGenerator</Generator>
+    </EmbeddedResource>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Update="Resources\PromptDescriptions.Designer.cs">
+      <DesignTime>True</DesignTime>
+      <AutoGen>True</AutoGen>
+      <DependentUpon>PromptDescriptions.resx</DependentUpon>
+    </Compile>
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Update="Resources\PromptDescriptions.resx">
+      <LastGenOutput>PromptDescriptions.Designer.cs</LastGenOutput>
+    </EmbeddedResource>
+  </ItemGroup>
+  <!-- Add prompt templates as embedded resources -->
+  <ItemGroup>
+    <EmbeddedResource Include="Prompts\Templates\*.md" />
+  </ItemGroup>
+
+</Project>

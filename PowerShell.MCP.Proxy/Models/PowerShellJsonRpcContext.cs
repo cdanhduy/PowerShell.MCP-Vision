@@ -1,0 +1,24 @@
+using System.Text.Json.Serialization;
+
+namespace PowerShell.MCP.Proxy.Models;
+
+// JsonSerializerContext for Source Generator
+[JsonSerializable(typeof(GetCurrentLocationParams))]
+[JsonSerializable(typeof(ExecuteCommandParams))]
+[JsonSerializable(typeof(GetStatusParams))]
+[JsonSerializable(typeof(ConsumeOutputParams))]
+[JsonSerializable(typeof(CacheOutputParams))]
+[JsonSerializable(typeof(ClaimConsoleParams))]
+[JsonSerializable(typeof(SetWindowTitleParams))]
+[JsonSerializable(typeof(ExecuteSilentParams))]
+[JsonSerializable(typeof(CancelParams))]
+[JsonSerializable(typeof(Dictionary<string, string>))]
+[JsonSourceGenerationOptions(
+    PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower,
+    WriteIndented = false,
+    GenerationMode = JsonSourceGenerationMode.Default
+)]
+
+public partial class PowerShellJsonRpcContext : JsonSerializerContext
+{
+}

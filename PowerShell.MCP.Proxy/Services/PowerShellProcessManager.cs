@@ -1,0 +1,582 @@
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using PowerShell.MCP.Proxy.Models;
+
+namespace PowerShell.MCP.Proxy.Services;
+
+public class PowerShellProcessManager
+{
+    /// <summary>
+    /// Starts PowerShell process with PowerShell.MCP module imported and returns pipe name
+    /// </summary>
+    /// <param name="agentId">Agent ID for console isolation</param>
+    /// <param name="startupCommands">Optional PowerShell commands to execute after module import (e.g. Write-Host statements)</param>
+    /// <param name="startLocation">Starting directory path</param>
+    /// <returns>Tuple of (success, pipeName)</returns>
+    public static async Task<(bool Success, string PipeName)> StartPowerShellWithModuleAndPipeNameAsync(string agentId, string? startupCommands = null, string? startLocation = null)
+    {
+        int pid = 0;
+        HashSet<string>? existingPipes = null;
+
+        // macOS/Linux: Capture existing pipes BEFORE launching
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            var sessionManager = ConsoleSessionManager.Instance;
+            existingPipes = sessionManager.EnumeratePipes(sessionManager.ProxyPid, agentId).ToHashSet();
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            pid = PwshLauncherWindows.LaunchPwsh(agentId, startupCommands, startLocation);
+        }
+        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            PwshLauncherMacOS.LaunchPwsh(agentId, startupCommands, startLocation);
+        }
+        else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            PwshLauncherLinux.LaunchPwsh(agentId, startupCommands, startLocation);
+        }
+        else
+        {
+            throw new PlatformNotSupportedException("Unsupported operating system");
+        }
+
+        // Wait for Named Pipe to be ready
+        string? pipeName;
+        if (pid != 0)
+        {
+            // Windows: We know the PID, construct pipe name with proxy PID, agent ID, and pwsh PID
+            var proxyPid = Process.GetCurrentProcess().Id;
+            pipeName = ConsoleSessionManager.GetPipeNameForPids(proxyPid, agentId, pid);
+        }
+        else
+        {
+            // macOS/Linux: Poll for a NEW standby pipe (exclude existing pipes)
+            pipeName = await WaitForNewStandbyPipeAsync(agentId, existingPipes!, maxWaitSeconds: 30);
+            if (pipeName == null)
+            {
+                return (false, string.Empty);
+            }
+        }
+
+        var success = await NamedPipeClient.WaitForPipeReadyAsync(pipeName);
+
+        return (success, pipeName);
+    }
+
+    /// <summary>
+    /// Waits for a NEW standby pipe to become available (for macOS/Linux)
+    /// Polls every 500ms until a new standby pipe is found or timeout
+    /// </summary>
+    private static async Task<string?> WaitForNewStandbyPipeAsync(string agentId, HashSet<string> existingPipes, int maxWaitSeconds)
+    {
+        var endTime = DateTime.UtcNow.AddSeconds(maxWaitSeconds);
+
+        while (DateTime.UtcNow < endTime)
+        {
+            var pipe = await FindNewStandbyPipeAsync(agentId, existingPipes);
+            if (pipe != null)
+            {
+                return pipe;
+            }
+
+            await Task.Delay(500);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Finds a NEW standby pipe from available pipes (excludes existing pipes)
+    /// </summary>
+    private static async Task<string?> FindNewStandbyPipeAsync(string agentId, HashSet<string> existingPipes)
+    {
+        var client = new NamedPipeClient();
+
+        foreach (var pipe in ConsoleSessionManager.Instance.EnumeratePipes(ConsoleSessionManager.Instance.ProxyPid, agentId))
+        {
+            // Skip pipes that existed before launching
+            if (existingPipes.Contains(pipe))
+            {
+                continue;
+            }
+
+            try
+            {
+                var request = "{\"name\":\"get_status\"}";
+                var response = await client.SendRequestToAsync(pipe, request);
+
+                using var doc = System.Text.Json.JsonDocument.Parse(response);
+                var status = doc.RootElement.GetProperty("status").GetString();
+
+                if (PipeStatus.IsReady(status))
+                {
+                    return pipe;
+                }
+            }
+            catch
+            {
+                // Skip this pipe (dead or unresponsive)
+            }
+        }
+        return null;
+    }
+}
+
+/// <summary>
+/// PowerShell snippets shared across platform-specific launchers.
+/// </summary>
+internal static class PwshLauncherShared
+{
+    internal const string NoProfileArgument = "-NoProfile";
+
+    // Force the new console's active code page to UTF-8 BEFORE PSReadLine
+    // imports. On Japanese / Chinese / Korean Windows the system code page
+    // is 932 / 936 / 949, and CREATE_NEW_CONSOLE inherits that as the
+    // console's active code page. PowerShell 7 sets [Console]::OutputEncoding
+    // to UTF-8 but leaves InputEncoding alone, so PSReadLine's menu rendering
+    // (which goes through Win32 console APIs that respect the active code
+    // page in some paths) ends up reinterpreting UTF-8 writes as the legacy
+    // multibyte encoding and produces mojibake on tab completion menus.
+    // Setting chcp + both Console encodings BEFORE Import-Module PSReadLine
+    // makes the launched console UTF-8 throughout. Safe on non-CJK systems
+    // (UTF-8 covers ASCII / Latin-1 just as well).
+    internal const string EncodingPrelude =
+        "chcp 65001 | Out-Null; "
+        + "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; "
+        + "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ";
+
+    // Install-PSResource on case-sensitive file systems (Linux, case-sensitive APFS on macOS)
+    // may create the module directory as 'powershell.mcp'. Rename it so Import-Module can
+    // locate the PascalCase name. No-op on case-insensitive file systems.
+    internal const string ModuleCaseFix = "foreach ($p in ($env:PSModulePath -split [IO.Path]::PathSeparator)) { if ([string]::IsNullOrWhiteSpace($p)) { continue }; $lc = Join-Path $p 'powershell.mcp'; $uc = Join-Path $p 'PowerShell.MCP'; if ((Test-Path $lc) -and -not (Test-Path $uc)) { Rename-Item $lc $uc; break } }; ";
+
+    // Builds the PowerShell initialization command shared by every non-Windows launcher.
+    // The actual delivery to pwsh differs per platform — macOS writes this to /tmp and
+    // launches with `-File`, Linux Base64-encodes it for `-EncodedCommand` because of
+    // shell quoting through `sh -c` — but the script body is identical. Single quotes
+    // inside agentId / startLocation are escaped per PowerShell's '' convention so a
+    // future ID format change can't break the launch line.
+    // Kept internal so unit tests can lock in shell-safety without spawning a process.
+    internal static string BuildInitCommand(int proxyPid, string agentId, string? startupCommands, string? startLocation)
+    {
+        var setLocation = string.IsNullOrEmpty(startLocation)
+            ? "Set-Location ~; "
+            : $"Set-Location -LiteralPath '{startLocation.Replace("'", "''")}'; ";
+
+        var escapedAgentId = agentId.Replace("'", "''");
+        var core = $"{EncodingPrelude}{setLocation}$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{escapedAgentId}'; {ModuleCaseFix}Import-Module PowerShell.MCP -Force; Remove-Module PSReadLine -ErrorAction SilentlyContinue";
+        return string.IsNullOrEmpty(startupCommands) ? core : $"{core}; {startupCommands}";
+    }
+
+    // Windows counterpart to BuildInitCommand. Diverges deliberately from the
+    // non-Windows body in two ways, hence a separate builder rather than a flag:
+    //  - it KEEPS PSReadLine (Import, not Remove) — on Windows the real console
+    //    host uses PSReadLine for editing/prediction, whereas the Unix launchers
+    //    swap in the custom PSConsoleHostReadLine polling shim;
+    //  - it omits Set-Location and ModuleCaseFix — Windows sets the cwd via the
+    //    CreateProcessW lpCurrentDirectory argument, and its file system is
+    //    case-insensitive so the powershell.mcp -> PowerShell.MCP rename is moot.
+    // agentId is escaped per PowerShell's '' convention, matching BuildInitCommand
+    // so a future ID format that contained a quote can't break the launch line.
+    internal static string BuildWindowsInitCommand(int proxyPid, string agentId, string? startupCommands)
+    {
+        var escapedAgentId = agentId.Replace("'", "''");
+        var core = $"{EncodingPrelude}$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{escapedAgentId}'; Import-Module PowerShell.MCP -Force; Import-Module PSReadLine";
+        return string.IsNullOrEmpty(startupCommands) ? core : $"{core}; {startupCommands}";
+    }
+
+    // Set once at startup from the proxy's `--no-profile` command-line flag.
+    // Gates -NoProfile on the *interactive* launchers (Windows/macOS/Linux) only.
+    // Default false: those consoles are real human-facing shells, so they load the
+    // user's $PROFILE (prompt, aliases, PSReadLine, theme) unless the operator opts
+    // out. The headless launcher always uses -NoProfile regardless — see
+    // BuildHeadlessPwshArguments.
+    internal static bool SuppressProfileOnInteractive { get; set; }
+
+    private static string InteractiveProfileArg(bool noProfile) =>
+        noProfile ? $"{NoProfileArgument} " : string.Empty;
+
+    internal static string BuildWindowsCommandLine(string command, bool noProfile) =>
+        $"pwsh.exe {InteractiveProfileArg(noProfile)}-NoExit -Command \"{command}\"";
+
+    internal static string BuildMacOSDoScriptCommand(string tempFile, bool noProfile) =>
+        $"pwsh {InteractiveProfileArg(noProfile)}-NoExit -File '{tempFile}'";
+
+    internal static string BuildLinuxPwshCommand(string encodedCommand, bool noProfile) =>
+        $"exec pwsh {InteractiveProfileArg(noProfile)}-NoExit -EncodedCommand {encodedCommand}";
+
+    // The headless / CI launcher (no window, redirected stdout) always suppresses
+    // the profile: there's no interactive UX to preserve, and a profile there only
+    // adds nondeterminism, startup latency, host-write noise, and the risk of
+    // blocking on input (e.g. Read-Host) in a process with no console.
+    internal static string[] BuildHeadlessPwshArguments(string initCommand) =>
+        [NoProfileArgument, "-NoExit", "-Command", initCommand];
+}
+
+/// <summary>
+/// Windows-specific launcher using Win32 API to create a new console window
+/// </summary>
+public static class PwshLauncherWindows
+{
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+    [DllImport("userenv.dll", SetLastError = true)]
+    private static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
+
+    [DllImport("userenv.dll", SetLastError = true)]
+    private static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CreateProcessW(
+        string? lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string? lpCurrentDirectory,
+        ref STARTUPINFOW lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFOW
+    {
+        public uint cb;
+        public string? lpReserved;
+        public string? lpDesktop;
+        public string? lpTitle;
+        public uint dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public ushort wShowWindow;
+        public ushort cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+
+    private const uint TOKEN_QUERY = 0x0008;
+    private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+    private const uint CREATE_NEW_CONSOLE = 0x00000010;
+
+    public static int LaunchPwsh(string agentId, string? startupCommands = null, string? startLocation = null)
+    {
+        IntPtr hToken = IntPtr.Zero;
+        IntPtr env = IntPtr.Zero;
+        IntPtr hProcess = IntPtr.Zero;
+        IntPtr hThread = IntPtr.Zero;
+        int pid = 0;
+
+        try
+        {
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, out hToken))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+
+            // false = do not inherit current process environment
+            // This uses only system/user default environment variables (Control Panel settings)
+            if (!CreateEnvironmentBlock(out env, hToken, false))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+
+            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+            var si = new STARTUPINFOW { cb = (uint)Marshal.SizeOf<STARTUPINFOW>() };
+            var pi = new PROCESS_INFORMATION();
+
+            // Build command with optional startup commands (pre-built Write-Host statements)
+            // Set global variables with proxy PID and agent ID before importing module.
+            // Prelude flips the new console's active code page + Console.* encodings to
+            // UTF-8 BEFORE PSReadLine imports, so menu rendering on CJK Windows doesn't
+            // mojibake. See PwshLauncherShared.EncodingPrelude for the rationale.
+            var proxyPid = Process.GetCurrentProcess().Id;
+            string command = PwshLauncherShared.BuildWindowsInitCommand(proxyPid, agentId, startupCommands);
+            string commandLine = PwshLauncherShared.BuildWindowsCommandLine(command, PwshLauncherShared.SuppressProfileOnInteractive);
+
+            bool ok = CreateProcessW(
+                null,
+                commandLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
+                env,
+                startLocation ?? userProfile,
+                ref si,
+                out pi);
+
+            if (!ok) throw new Win32Exception(Marshal.GetLastWin32Error());
+
+            pid = (int)pi.dwProcessId;
+            hProcess = pi.hProcess;
+            hThread = pi.hThread;
+        }
+        finally
+        {
+            if (env != IntPtr.Zero)
+                DestroyEnvironmentBlock(env);
+
+            if (hToken != IntPtr.Zero)
+                CloseHandle(hToken);
+
+            if (hProcess != IntPtr.Zero)
+                CloseHandle(hProcess);
+
+            if (hThread != IntPtr.Zero)
+                CloseHandle(hThread);
+        }
+
+        return pid;
+    }
+}
+
+/// <summary>
+/// macOS-specific launcher using AppleScript to open Terminal.app
+/// </summary>
+public static class PwshLauncherMacOS
+{
+    public static void LaunchPwsh(string agentId, string? startupCommands = null, string? startLocation = null)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "osascript",
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            CreateNoWindow = true
+        };
+
+        var proxyPid = Process.GetCurrentProcess().Id;
+        var initCommand = PwshLauncherShared.BuildInitCommand(proxyPid, agentId, startupCommands, startLocation);
+
+        // Write the init to a temp .ps1 and launch with `-File`. AppleScript's `do script`
+        // types its argument into the Terminal window verbatim — if we passed the PS source
+        // directly (or a Base64 -EncodedCommand) the user would see ~1KB of noise scroll past
+        // every time a console starts. A short `-File /tmp/xyz.ps1` stays readable.
+        // The script self-deletes on first line so there is no long-lived debris.
+        // We intentionally use /tmp (world-known, symlink-resolved, ASCII-safe in AppleScript
+        // string context) rather than $TMPDIR which is per-user and varies across setups.
+        var tempFile = $"/tmp/pwsh-mcp-init-{Guid.NewGuid():N}.ps1";
+        var scriptBody = $"Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue{Environment.NewLine}{initCommand}";
+        File.WriteAllText(tempFile, scriptBody);
+
+        using var process = Process.Start(psi);
+        if (process != null)
+        {
+            process.StandardInput.WriteLine("tell application \"Terminal\"");
+            process.StandardInput.WriteLine("    activate");
+            process.StandardInput.WriteLine($"    do script \"{PwshLauncherShared.BuildMacOSDoScriptCommand(tempFile, PwshLauncherShared.SuppressProfileOnInteractive)}\"");
+            process.StandardInput.WriteLine("end tell");
+            process.StandardInput.Close();
+            process.WaitForExit(5000);
+        }
+    }
+
+}
+
+/// <summary>
+/// Linux-specific launcher that tries multiple terminal emulators
+/// </summary>
+public static class PwshLauncherLinux
+{
+    // Terminal emulator configurations: (name, useShellWrapper, args...)
+    // useShellWrapper: true = use "sh -c" to wrap the command (for terminals that need a single command string)
+    private static readonly string[] SupportedTerminals =
+    [
+        "gnome-terminal",
+        "konsole",
+        "xfce4-terminal",
+        "xterm",
+        "lxterminal",
+        "mate-terminal",
+        "terminator",
+        "tilix",
+        "alacritty",
+        "kitty",
+    ];
+
+    public static void LaunchPwsh(string agentId, string? startupCommands = null, string? startLocation = null)
+    {
+        foreach (var terminal in SupportedTerminals)
+        {
+            if (TryLaunchTerminal(terminal, agentId, startupCommands, startLocation))
+            {
+                return;
+            }
+        }
+
+        // No terminal emulator found - launch pwsh directly (headless/CI mode)
+        Console.Error.WriteLine("[INFO] No terminal emulator found, launching pwsh directly");
+        LaunchPwshDirectly(agentId, startupCommands, startLocation);
+    }
+
+    private static bool TryLaunchTerminal(string terminal, string agentId, string? startupCommands, string? startLocation)
+    {
+        try
+        {
+            // Check if terminal exists using 'which'
+            var whichPsi = new ProcessStartInfo
+            {
+                FileName = "which",
+                Arguments = terminal,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+
+            using var whichProcess = Process.Start(whichPsi);
+            whichProcess?.WaitForExit(2000);
+
+            if (whichProcess?.ExitCode != 0)
+            {
+                return false;
+            }
+
+            // Get user's default shell
+            var shell = Environment.GetEnvironmentVariable("SHELL") ?? "/bin/bash";
+
+            // Launch terminal via setsid to detach from parent process
+            // We use the user's login shell to ensure ~/.bash_profile or ~/.zprofile is loaded,
+            // which sets up PATH and other environment variables correctly.
+            // This mimics what happens when a user manually opens a terminal and types 'pwsh'.
+            var psi = new ProcessStartInfo
+            {
+                FileName = "setsid",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            // Build the PowerShell init script (shared with macOS) and encode to Base64.
+            // Linux delivers it via -EncodedCommand because the launch path goes through
+            // `setsid <terminal> ... <shell> -l -c '<pwshCommand>'` and quoting through
+            // multiple shell layers is fragile; -EncodedCommand sidesteps that entirely.
+            var proxyPid = Process.GetCurrentProcess().Id;
+            var initCommand = PwshLauncherShared.BuildInitCommand(proxyPid, agentId, startupCommands, startLocation);
+            var encodedCommand = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(initCommand));
+
+            // Command to launch pwsh with encoded initialization via login shell
+            // exec replaces the shell with pwsh to keep the process tree clean
+            var pwshCommand = PwshLauncherShared.BuildLinuxPwshCommand(encodedCommand, PwshLauncherShared.SuppressProfileOnInteractive);
+
+            // setsid <terminal> ... <shell> -l -c '<pwshCommand>'
+            psi.ArgumentList.Add(terminal);
+
+            // Configure arguments based on terminal type
+            switch (terminal)
+            {
+                case "gnome-terminal":
+                    psi.ArgumentList.Add("--");
+                    psi.ArgumentList.Add(shell);
+                    psi.ArgumentList.Add("-l");
+                    psi.ArgumentList.Add("-c");
+                    psi.ArgumentList.Add(pwshCommand);
+                    break;
+
+                case "konsole":
+                    psi.ArgumentList.Add("-e");
+                    psi.ArgumentList.Add(shell);
+                    psi.ArgumentList.Add("-l");
+                    psi.ArgumentList.Add("-c");
+                    psi.ArgumentList.Add(pwshCommand);
+                    break;
+
+                case "xterm":
+                case "lxterminal":
+                    psi.ArgumentList.Add("-e");
+                    psi.ArgumentList.Add(shell);
+                    psi.ArgumentList.Add("-l");
+                    psi.ArgumentList.Add("-c");
+                    psi.ArgumentList.Add(pwshCommand);
+                    break;
+
+                case "xfce4-terminal":
+                case "mate-terminal":
+                case "terminator":
+                case "tilix":
+                    // These terminals expect -e with a single command string
+                    psi.ArgumentList.Add("-e");
+                    psi.ArgumentList.Add($"{shell} -l -c '{pwshCommand}'");
+                    break;
+
+                case "alacritty":
+                    psi.ArgumentList.Add("-e");
+                    psi.ArgumentList.Add(shell);
+                    psi.ArgumentList.Add("-l");
+                    psi.ArgumentList.Add("-c");
+                    psi.ArgumentList.Add(pwshCommand);
+                    break;
+
+                case "kitty":
+                    psi.ArgumentList.Add(shell);
+                    psi.ArgumentList.Add("-l");
+                    psi.ArgumentList.Add("-c");
+                    psi.ArgumentList.Add(pwshCommand);
+                    break;
+
+                default:
+                    return false;
+            }
+
+            Process.Start(psi)?.Dispose();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Launches pwsh directly without a terminal emulator (for CI/headless environments)
+    /// </summary>
+    private static void LaunchPwshDirectly(string agentId, string? startupCommands, string? startLocation)
+    {
+        // Reuse the shared init builder so a single source of truth (with proper
+        // single-quote escaping) covers terminal / headless / macOS paths. ArgumentList
+        // delivers -Command as a separate argv entry, so no Base64 encoding is needed
+        // here even though the terminal-launched Linux path uses -EncodedCommand.
+        // BuildInitCommand prepends Set-Location, so the headless cwd is established
+        // by the script body itself; -WorkingDirectory is no longer needed.
+        var proxyPid = Process.GetCurrentProcess().Id;
+        var initCommand = PwshLauncherShared.BuildInitCommand(proxyPid, agentId, startupCommands, startLocation);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "pwsh",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (var argument in PwshLauncherShared.BuildHeadlessPwshArguments(initCommand))
+        {
+            psi.ArgumentList.Add(argument);
+        }
+
+        var process = Process.Start(psi);
+        if (process != null)
+        {
+            // Drain stdout/stderr asynchronously to prevent buffer deadlocks
+            // Log to stderr (which is separate from MCP stdio transport)
+            process.OutputDataReceived += (_, e) => { if (e.Data != null) Console.Error.WriteLine($"[HEADLESS] {e.Data}"); };
+            process.ErrorDataReceived += (_, e) => { if (e.Data != null) Console.Error.WriteLine($"[HEADLESS-ERR] {e.Data}"); };
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+        }
+    }
+}

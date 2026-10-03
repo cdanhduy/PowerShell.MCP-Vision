@@ -1,0 +1,1408 @@
+using System.IO.Pipes;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Diagnostics;
+
+namespace PowerShell.MCP.Services;
+
+/// <summary>
+/// Static class for managing execution state
+/// Status: standby / busy (status is derived from state, not stored)
+/// </summary>
+public static class ExecutionState
+{
+    // Unified lock for all shared state (replaces the former _cacheLock)
+    private static readonly object _lock = new();
+
+    private static bool _isBusy = false;
+    private static readonly Stopwatch _stopwatch = new();
+    private static string _currentPipeline = "";
+
+    // Cached outputs (multiple outputs can accumulate)
+    private static readonly List<string> _cachedOutputs = new();
+
+    // Flag: should cache output on completion (set when busy/timeout response is sent)
+    private static bool _shouldCacheOutput = false;
+
+    // Heartbeat tracking for detecting user-initiated commands
+    private static DateTime _lastHeartbeat = DateTime.UtcNow;
+    private static bool _firstHeartbeatReceived = false;
+    private const int HeartbeatTimeoutMs = 10000; // If no heartbeat for 10s, runspace is likely busy
+
+    // Startup window of a proxy-launched console (see BeginStartup). The grace
+    // matches how long the proxy itself waits for a new console's pipe.
+    private static bool _startupPending = false;
+    private static bool _firstPromptRendered = false;
+    private static DateTime _startupBeganUtc;
+    internal const int StartupGraceMs = 60000;
+
+    // Clock seam for the startup window, overridable from tests (via
+    // InternalsVisibleTo) so the grace can be crossed without a real wait.
+    internal static Func<DateTime> StartupClock = () => DateTime.UtcNow;
+
+    // PowerShell PSDrive cwd as seen on the runspace's home thread. Updated
+    // by MCPPollingEngine.ps1 every timer tick (~100ms when idle), so the
+    // proxy's cwd-tracking sees AI's intended cwd ($PWD) — not the process
+    // cwd, which is NOT kept in sync by Set-Location for PowerShell-managed
+    // FileSystem providers. Read by the cwd snapshot points in the pipe
+    // server (busy/timeout/completed/success responses + get_status); falls
+    // back to Directory.GetCurrentDirectory() before the first heartbeat.
+    private static string? _currentAiCwd;
+
+    /// <summary>
+    /// Gets the current status (derived from state, atomically)
+    /// </summary>
+    public static string Status
+    {
+        get
+        {
+            lock (_lock)
+            {
+                if (_isBusy) return "busy";
+                return _cachedOutputs.Count > 0 ? "completed" : "standby";
+            }
+        }
+    }
+
+    public static string CurrentPipeline
+    {
+        get { lock (_lock) { return _currentPipeline; } }
+    }
+
+    /// <summary>
+    /// Gets the elapsed time in seconds since execution started
+    /// </summary>
+    public static double ElapsedSeconds
+    {
+        get { lock (_lock) { return _stopwatch.Elapsed.TotalSeconds; } }
+    }
+
+    /// <summary>
+    /// Checks if there is cached output
+    /// </summary>
+    public static bool HasCachedOutput
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _cachedOutputs.Count > 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks if output should be cached on completion
+    /// </summary>
+    public static bool ShouldCacheOutput
+    {
+        get { lock (_lock) { return _shouldCacheOutput; } }
+    }
+
+    /// <summary>
+    /// Updates the heartbeat timestamp. Called from PowerShell timer event.
+    /// </summary>
+    public static void Heartbeat()
+    {
+        lock (_lock)
+        {
+            _lastHeartbeat = DateTime.UtcNow;
+            _firstHeartbeatReceived = true;
+
+            // The first tick after the first prompt means the console is idle at
+            // an interactive prompt, so the startup window can close. Closing it
+            // at the render itself would be too early: the host still has to
+            // enter ReadLine (PSReadLine loads its history there) before the
+            // runspace ticks again.
+            if (_startupPending && _firstPromptRendered)
+            {
+                _startupPending = false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Opens the startup window of a console launched by the proxy. Until the
+    /// console is idle at its first prompt, a gap in heartbeats is startup work
+    /// still running (the rest of the startup command, the first prompt render,
+    /// ReadLine loading its history): nobody can have typed a command into a
+    /// console that has not shown a prompt yet. Reporting that gap as a user
+    /// command made the proxy abandon a console it had spawned seconds earlier
+    /// and start a second one. The window closes on the first heartbeat after
+    /// the first prompt (<see cref="MarkFirstPromptRendered"/>), or after
+    /// <see cref="StartupGraceMs"/> for a launch that never gets there, so a
+    /// console that is genuinely wedged still ends up reported as busy.
+    /// </summary>
+    public static void BeginStartup()
+    {
+        lock (_lock)
+        {
+            _startupPending = true;
+            _firstPromptRendered = false;
+            _startupBeganUtc = StartupClock();
+        }
+    }
+
+    /// <summary>
+    /// Records that the host rendered a prompt. The startup window then closes
+    /// on the next heartbeat (see <see cref="Heartbeat"/>).
+    /// </summary>
+    public static void MarkFirstPromptRendered()
+    {
+        lock (_lock) { _firstPromptRendered = true; }
+    }
+
+    /// <summary>
+    /// Closes the startup window outright. Used on import into a console no
+    /// proxy launched, which is already sitting at a prompt.
+    /// </summary>
+    public static void MarkStartupComplete()
+    {
+        lock (_lock) { _startupPending = false; }
+    }
+
+    /// <summary>
+    /// True while a proxy-launched console is still inside its startup window.
+    /// </summary>
+    public static bool IsStartingUp
+    {
+        get { lock (_lock) { return InStartupWindowLocked(); } }
+    }
+
+    // Caller must hold _lock.
+    private static bool InStartupWindowLocked()
+        => _startupPending && (StartupClock() - _startupBeganUtc).TotalMilliseconds < StartupGraceMs;
+
+    /// <summary>
+    /// Test hook: backdates the last heartbeat, as if the runspace had stopped
+    /// ticking at <paramref name="utc"/>.
+    /// </summary>
+    internal static void SetLastHeartbeatForTests(DateTime utc)
+    {
+        lock (_lock)
+        {
+            _lastHeartbeat = utc;
+            _firstHeartbeatReceived = true;
+        }
+    }
+
+    /// <summary>
+    /// Records the runspace's PSDrive cwd ($PWD.Path). Called from the
+    /// MCPPollingEngine timer tick on the runspace's home thread, where
+    /// $PWD reflects every Set-Location (process cwd does not). Pass null
+    /// only on shutdown.
+    /// </summary>
+    public static void SetCurrentAiCwd(string? cwd)
+    {
+        lock (_lock) { _currentAiCwd = cwd; }
+    }
+
+    /// <summary>
+    /// Returns the most recent <c>$PWD.Path</c> snapshot from the runspace,
+    /// or null before the first timer tick has fired. The pipe server
+    /// reads this on every cwd-emitting response so the proxy sees AI's
+    /// intended cwd, not the stale process cwd.
+    /// </summary>
+    public static string? CurrentAiCwd
+    {
+        get { lock (_lock) { return _currentAiCwd; } }
+    }
+
+    /// <summary>
+    /// Checks if the PowerShell runspace is available (heartbeat is recent)
+    /// </summary>
+    public static bool IsRunspaceAvailable
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return !_firstHeartbeatReceived || InStartupWindowLocked() || (DateTime.UtcNow - _lastHeartbeat).TotalMilliseconds < HeartbeatTimeoutMs;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets the estimated elapsed time in seconds since user command started (heartbeat timed out)
+    /// </summary>
+    public static double UserCommandElapsedSeconds
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return (DateTime.UtcNow - _lastHeartbeat).TotalSeconds;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Waits for a heartbeat to confirm runspace availability.
+    /// If heartbeat was received recently (within recentThresholdMs), returns true immediately.
+    /// If more than heartbeatTimeoutMs has passed since last heartbeat, returns false immediately.
+    /// Otherwise waits until heartbeatTimeoutMs has passed since last heartbeat.
+    /// Returns true if runspace is available, false if busy with user command.
+    /// </summary>
+    public static bool WaitForHeartbeat(int heartbeatTimeoutMs = 10000, int recentThresholdMs = 500)
+    {
+        DateTime lastKnown;
+        double timeSinceLastMs;
+
+        lock (_lock)
+        {
+            // Before the first tick, or inside a proxy launch's startup window,
+            // a heartbeat gap is startup work still running, not a user command.
+            if (!_firstHeartbeatReceived || InStartupWindowLocked())
+            {
+                return true;
+            }
+
+            timeSinceLastMs = (DateTime.UtcNow - _lastHeartbeat).TotalMilliseconds;
+            if (timeSinceLastMs < recentThresholdMs)
+            {
+                return true;
+            }
+            if (timeSinceLastMs >= heartbeatTimeoutMs)
+            {
+                return false;
+            }
+
+            lastKnown = _lastHeartbeat;
+        }
+
+        // Polling loop - acquire lock briefly each iteration to check state
+        var remainingWaitMs = heartbeatTimeoutMs - timeSinceLastMs;
+        var waitEndTime = DateTime.UtcNow.AddMilliseconds(remainingWaitMs);
+
+        while (DateTime.UtcNow < waitEndTime)
+        {
+            Thread.Sleep(50);
+            lock (_lock)
+            {
+                if (_lastHeartbeat > lastKnown)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    public static void SetBusy(string pipeline)
+    {
+        lock (_lock)
+        {
+            _stopwatch.Restart();
+            _currentPipeline = pipeline;
+            _shouldCacheOutput = false;
+            _isBusy = true;
+        }
+    }
+
+    /// <summary>
+    /// Marks that the output should be cached on completion.
+    /// Called when a busy/timeout response is sent.
+    /// </summary>
+    public static void MarkForCaching()
+    {
+        lock (_lock) { _shouldCacheOutput = true; }
+    }
+
+    /// <summary>
+    /// Completes execution (called from finally block after command execution)
+    /// </summary>
+    public static void CompleteExecution()
+    {
+        lock (_lock)
+        {
+            _stopwatch.Stop();
+            _currentPipeline = "";
+            _isBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// Adds output to cache (called when MCP client won't receive the result directly)
+    /// </summary>
+    public static void AddToCache(string output)
+    {
+        lock (_lock)
+        {
+            _cachedOutputs.Add(output);
+            _shouldCacheOutput = false;
+        }
+    }
+
+    /// <summary>
+    /// Puts back output that was already drained into a response the MCP
+    /// client never received — it cancelled (or timed out) the tool call the
+    /// response belonged to, so the JSON-RPC reply had no handler left to
+    /// land in. The proxy pushes the text back here so the next tool call
+    /// drains it through the normal cache path.
+    ///
+    /// Two deliberate differences from <see cref="AddToCache"/>:
+    /// - <c>_shouldCacheOutput</c> is left untouched. That flag belongs to
+    ///   whatever command is running right now; clearing it here would
+    ///   reroute that command's own result away from the cache.
+    /// - The text is inserted at the front. It is chronologically older than
+    ///   anything a concurrent command may have added since the drain.
+    /// </summary>
+    public static void ReturnToCache(string output)
+    {
+        lock (_lock)
+        {
+            _cachedOutputs.Insert(0, output);
+        }
+    }
+
+    /// <summary>
+    /// Peeks cached outputs without consuming them
+    /// </summary>
+    public static IReadOnlyList<string> PeekCachedOutputs()
+    {
+        lock (_lock)
+        {
+            return _cachedOutputs.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Consumes all cached outputs (returns and clears them)
+    /// </summary>
+    public static IReadOnlyList<string> ConsumeCachedOutputs()
+    {
+        lock (_lock)
+        {
+            var result = _cachedOutputs.ToList();
+            _cachedOutputs.Clear();
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Discards any undrained cached outputs and the "cache on completion"
+    /// flag. Called when the owning AI session goes away (see
+    /// MCPModuleInitializer.ReleaseConsole): that output belonged to the
+    /// now-dead session, so the orphaned console must report 'standby'
+    /// rather than 'completed' with output a freshly-connecting AI would
+    /// otherwise drain as if it were its own. Unlike ConsumeCachedOutputs,
+    /// this discards without returning — there is no live consumer.
+    /// _isBusy is intentionally left untouched: a pipeline still running at
+    /// disconnect is genuinely busy and must keep reporting so.
+    /// </summary>
+    public static void ClearCachedOutputs()
+    {
+        lock (_lock)
+        {
+            _cachedOutputs.Clear();
+            _shouldCacheOutput = false;
+        }
+    }
+
+    // ===== Proxy-exit signal (event-driven disconnect detection) =====
+    // Set by MCPModuleInitializer's Process.Exited handler — a thread-pool
+    // thread — the instant the owning proxy exits. Consumed on the runspace's
+    // home thread by MCPPollingEngine's timer tick, which then runs the
+    // thread-affine ReleaseConsole + disconnect notice (~100ms latency instead
+    // of the slow ~5s liveness poll). A single flag is enough: the engine only
+    // needs to learn "the proxy we were watching is gone" once.
+    private static bool _proxyExited;
+
+    /// <summary>Signals that the watched proxy process has exited (thread-safe).</summary>
+    public static void SignalProxyExited()
+    {
+        lock (_lock) { _proxyExited = true; }
+    }
+
+    /// <summary>Returns true once if a proxy exit was signaled, then clears it.</summary>
+    public static bool ConsumeProxyExited()
+    {
+        lock (_lock)
+        {
+            if (!_proxyExited) return false;
+            _proxyExited = false;
+            return true;
+        }
+    }
+}
+
+/// <summary>
+/// Named Pipe server - handles communication with PowerShell.MCP.Proxy.exe
+/// Returns "busy" response while command is executing
+/// </summary>
+public class NamedPipeServer : IDisposable
+{
+    public const string BasePipeName = "PSMCP";
+    private const int MaxConcurrentConnections = 2; // Two pipe instances
+
+    /// <summary>
+    /// Gets the pipe name (with or without PID suffix depending on registration)
+    /// </summary>
+    public string PipeName { get; }
+
+    private readonly CancellationTokenSource _internalCancellation = new();
+    private readonly List<Task> _serverTasks = new();
+    private bool _disposed = false;
+
+    /// <summary>
+    /// Creates a new Named Pipe server with the specified pipe name
+    /// </summary>
+    /// <param name="proxyPid">Proxy PID to include in pipe name (null for user-started consoles)</param>
+    /// <param name="agentId">Agent ID for console isolation (null defaults to "default")</param>
+    public NamedPipeServer(int? proxyPid, string? agentId = null)
+    {
+        if (proxyPid.HasValue)
+        {
+            var aid = agentId ?? "default";
+            PipeName = $"{BasePipeName}.{proxyPid.Value}.{aid}.{Environment.ProcessId}";
+        }
+        else
+        {
+            PipeName = $"{BasePipeName}.{Environment.ProcessId}";
+        }
+    }
+
+    /// <summary>
+    /// Starts the Named Pipe server
+    /// </summary>
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, _internalCancellation.Token);
+
+        try
+        {
+            // Start multiple server instances
+            for (int i = 0; i < MaxConcurrentConnections; i++)
+            {
+                var task = RunServerInstanceAsync(combinedCts.Token);
+                _serverTasks.Add(task);
+            }
+
+            // Wait for all server instances to complete
+            await Task.WhenAll(_serverTasks);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is normal termination
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Named Pipe Server error: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Runs a server instance
+    /// </summary>
+    private async Task RunServerInstanceAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                using var pipeServer = CreateNamedPipeServer();
+
+                // Wait for client connection
+                await pipeServer.WaitForConnectionAsync(cancellationToken);
+
+                // Handle communication with connected client
+                await HandleClientAsync(pipeServer, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Named Pipe Server instance error: {ex.Message}");
+
+                // Wait a moment before retrying on error
+                try
+                {
+                    await Task.Delay(1000, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+    }
+    /// <summary>
+    /// Creates a Named Pipe server
+    /// </summary>
+    private NamedPipeServerStream CreateNamedPipeServer()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var pipeSecurity = new PipeSecurity();
+            pipeSecurity.AddAccessRule(new PipeAccessRule(
+                WindowsIdentity.GetCurrent().User!,
+                PipeAccessRights.FullControl,
+                AccessControlType.Allow));
+
+            return NamedPipeServerStreamAcl.Create(
+                PipeName,
+                PipeDirection.InOut,
+                NamedPipeServerStream.MaxAllowedServerInstances,
+                PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous,
+                0,
+                0,
+                pipeSecurity);
+        }
+
+        var pipeServer = new NamedPipeServerStream(
+            PipeName,
+            PipeDirection.InOut,
+            NamedPipeServerStream.MaxAllowedServerInstances,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+
+        // Restrict Unix socket permissions to owner-only (rw-------)
+        try
+        {
+            var socketPath = Path.Combine(Path.GetTempPath(), $"CoreFxPipe_{PipeName}");
+            if (File.Exists(socketPath))
+            {
+                File.SetUnixFileMode(socketPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+        }
+        catch
+        {
+            // Best-effort: permission setting may fail if socket path convention differs
+        }
+
+        return pipeServer;
+    }
+
+    /// <summary>
+    /// Handles client communication
+    /// </summary>
+    private static async Task HandleClientAsync(NamedPipeServerStream pipeServer, CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Receive request
+            var requestJson = await ReceiveMessageAsync(pipeServer, cancellationToken);
+
+            // Parse JSON-RPC request
+            using var requestDoc = JsonDocument.Parse(requestJson);
+            var requestRoot = requestDoc.RootElement;
+
+            var name = requestRoot.GetProperty("name").GetString();
+
+            // Record liveness activity for requests that deliberately target
+            // THIS console (run a command, read its location, cancel it). NOT
+            // get_status / consume_output — those are the proxy's discovery
+            // probes that hit every sibling, so counting them would keep an
+            // idle standby console alive forever and defeat auto-reaping.
+            if (name is "execute_command" or "get_current_location" or "cancel")
+                ConsoleLiveness.RecordActivity();
+
+            // Handle get_status request FIRST - returns immediately without using main runspace
+            // Must be before version check because version check uses ExecuteSilentCommand which requires main runspace
+            if (name == "get_status")
+            {
+                var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+                var status = ExecutionState.Status;
+                // PSDrive $PWD cwd from the runspace, cached on the
+                // home thread by MCPPollingEngine's timer tick. Reading
+                // the cache here is just a property access — does NOT
+                // touch the runspace and is safe to call while a
+                // command is busy. The proxy uses this on every status
+                // probe (drift detection's live-cwd source, busy-auto-
+                // route's spawn location). Reading process cwd directly
+                // would silently lie because Set-Location updates only
+                // PSDrive, not the process-level cwd, for PowerShell-
+                // managed FileSystem providers.
+                string? cwd;
+                try { cwd = ExecutionState.CurrentAiCwd ?? System.IO.Directory.GetCurrentDirectory(); }
+                catch { cwd = null; }
+
+                // Human-presence sample for close_console's guard. Read here on
+                // the pipe thread — it needs no runspace, which is exactly what
+                // makes it usable against a console whose runspace is wedged
+                // (close_console's main use case). The sample AGE travels with
+                // the value so the proxy can tell "no text" apart from "the
+                // engine stopped ticking" and fail open on the latter.
+                // -1 means never sampled / unusably old.
+                bool typedText = false;
+                double typedTextAge = -1;
+                try
+                {
+                    var age = ConsoleLiveness.TypedTextSampleAgeSeconds;
+                    if (age <= 86_400)
+                    {
+                        typedText = ConsoleLiveness.TypedTextPresent;
+                        typedTextAge = Math.Round(age, 2);
+                    }
+                }
+                catch { }
+
+                string statusResponse;
+                if (status == "busy")
+                {
+                    // Mark for caching - Proxy will use another pipe, so result won't be received
+                    ExecutionState.MarkForCaching();
+
+                    var elapsed = ExecutionState.ElapsedSeconds;
+                    var runningPipeline = ExecutionState.CurrentPipeline;
+                    var truncatedPipeline = TruncatePipeline(runningPipeline);
+                    var roundedDuration = Math.Round(elapsed, 2);
+
+                    // The command may be busy specifically because it is parked
+                    // at an interactive prompt. Surface that as a distinct
+                    // status so the proxy/AI can choose to answer or close it
+                    // rather than treat it as a normal long-running command.
+                    if (PowerShellCommunication.IsAwaitingInput)
+                    {
+                        var promptText = PowerShellCommunication.AwaitingPromptText;
+                        var promptInfo = string.IsNullOrEmpty(promptText) ? "" : $" ({promptText})";
+                        var awaitingStatusLine = BuildStatusLine("⌨", $"Console is waiting for input{promptInfo}", "AwaitingInput", truncatedPipeline, roundedDuration);
+                        statusResponse = JsonSerializer.Serialize(new
+                        {
+                            pid,
+                            status = "awaiting_input",
+                            pipeline = truncatedPipeline,
+                            duration = roundedDuration,
+                            message = promptText,
+                            statusLine = awaitingStatusLine,
+                            cwd,
+                            typedText,
+                            typedTextAgeSeconds = typedTextAge
+                        });
+                    }
+                    else
+                    {
+                        var statusLine = BuildStatusLine("⧗", "Pipeline is running", "Busy", truncatedPipeline, roundedDuration);
+                        statusResponse = JsonSerializer.Serialize(new
+                        {
+                            pid,
+                            status = "busy",
+                            pipeline = truncatedPipeline,
+                            duration = roundedDuration,
+                            statusLine,
+                            cwd,
+                            typedText,
+                            typedTextAgeSeconds = typedTextAge
+                        });
+                    }
+                }
+                else if (status == "completed")
+                {
+                    // Has cached output(s) - report count (Proxy will call consume_output later)
+                    var cachedOutputs = ExecutionState.PeekCachedOutputs();
+                    var statusLine = BuildStatusLine("✓", "Pipeline completed (cached)", "Completed");
+                    statusResponse = JsonSerializer.Serialize(new
+                    {
+                        pid,
+                        status = "completed",
+                        cachedCount = cachedOutputs.Count,
+                        statusLine,
+                        cwd,
+                        typedText,
+                        typedTextAgeSeconds = typedTextAge
+                    });
+                }
+                else
+                {
+                    // standby - but check if runspace is actually available (via heartbeat)
+                    if (ExecutionState.IsRunspaceAvailable)
+                    {
+                        var statusLine = BuildStatusLine("●", "Console ready", "Standby");
+                        statusResponse = JsonSerializer.Serialize(new { pid, status = "standby", statusLine, cwd, typedText, typedTextAgeSeconds = typedTextAge });
+                    }
+                    else
+                    {
+                        // Runspace is busy with user command (no heartbeat received recently)
+                        var userDuration = Math.Round(ExecutionState.UserCommandElapsedSeconds, 2);
+                        var statusLine = BuildStatusLine("⧗", "User command running", "Busy", "(user command)", userDuration);
+                        statusResponse = JsonSerializer.Serialize(new
+                        {
+                            pid,
+                            status = "busy",
+                            pipeline = "(user command)",
+                            duration = userDuration,
+                            statusLine,
+                            cwd,
+                            typedText,
+                            typedTextAgeSeconds = typedTextAge
+                        });
+                    }
+                }
+
+                await SendMessageAsync(pipeServer, statusResponse + "\n\n", cancellationToken);
+                return;
+            }
+
+            // Handle consume_output request - consumes and returns all cached outputs
+            if (name == "consume_output")
+            {
+                var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+                var cachedOutputs = ExecutionState.ConsumeCachedOutputs();
+                var combinedOutput = string.Join("\n\n", cachedOutputs);
+                var header = JsonSerializer.Serialize(new
+                {
+                    pid,
+                    status = "success"
+                });
+                await SendMessageAsync(pipeServer, header + "\n\n" + combinedOutput, cancellationToken);
+                return;
+            }
+
+            // Handle cache_output request - puts back a response the proxy
+            // could not deliver because the MCP client had already cancelled
+            // (or timed out) the call it belonged to. Handled next to
+            // consume_output, BEFORE the busy gate: by the time the pushback
+            // arrives this console is often already running the next command,
+            // and the busy branch would answer "busy" and drop the text.
+            if (name == "cache_output")
+            {
+                var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+                var cachedText = requestRoot.TryGetProperty("output", out JsonElement cacheOutputElement)
+                    ? cacheOutputElement.GetString() : null;
+                if (!string.IsNullOrEmpty(cachedText))
+                {
+                    ExecutionState.ReturnToCache(cachedText);
+                }
+                var cacheResp = JsonSerializer.Serialize(new { pid, status = "success" });
+                await SendMessageAsync(pipeServer, cacheResp, cancellationToken);
+                return;
+            }
+
+            // Handle cancel request - sends a real Ctrl+C to the console
+            // group. Handled BEFORE the busy gate (and the version check)
+            // because its whole purpose is to interrupt a command that is
+            // currently running/blocked. Runs on this background pipe
+            // thread, so it fires even while the home thread is stuck in a
+            // prompt. The interrupted command unwinds through its normal
+            // finally -> NotifyResultReady -> CompleteExecution, flipping
+            // the console back to completed/standby.
+            if (name == "cancel")
+            {
+                var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+                // Ctrl+C reaches NATIVE children (git/npm/ssh waiting on
+                // stdin); stopping the home runspace's running pipeline
+                // reaches a PowerShell command (Start-Sleep, a loop), which
+                // Ctrl+C cannot. Only stop the pipeline when a command is
+                // actually in-flight, so an idle housekeeping tick is never
+                // interrupted; then re-arm the poll timer as a safety net so
+                // the engine keeps ticking through the stop's unwind.
+                var ctrlC = ConsoleControl.SendCtrlC();
+                var stoppedPipeline = false;
+                if (ExecutionState.Status == "busy")
+                {
+                    stoppedPipeline = ConsoleControl.StopRunningPipeline();
+                    ConsoleControl.EnsurePollTimerArmed();
+                }
+                var resp = JsonSerializer.Serialize(new { pid, status = (ctrlC || stoppedPipeline) ? "success" : "error" });
+                await SendMessageAsync(pipeServer, resp, cancellationToken);
+                return;
+            }
+
+            string? proxyVersion = requestRoot.TryGetProperty("proxy_version", out JsonElement proxyVersionElement)
+                ? proxyVersionElement.GetString() : "Not detected";
+
+            if (proxyVersion != MCPModuleInitializer.ServerVersion)
+            {
+                var output = McpServerHost.ExecuteSilentCommand("Get-MCPProxyPath");
+                string proxyExePath = output[(output.LastIndexOfAny(['\r', '\n']) + 1)..];
+
+                string message;
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    var escapedPath = McpServerHost.ExecuteSilentCommand("Get-MCPProxyPath -Escape");
+                    escapedPath = escapedPath[(escapedPath.LastIndexOfAny(['\r', '\n']) + 1)..];
+
+                    message =
+$@"PowerShell MCP Configuration Error
+
+ISSUE: PowerShell.MCP.Proxy version is outdated.
+- PowerShell.MCP module version: {MCPModuleInitializer.ServerVersion}
+- Proxy executable version: {proxyVersion}
+
+ACTION REQUIRED: Update your MCP client configuration
+- Executable path: {proxyExePath}
+- For JSON config, use escaped path: {escapedPath}
+
+QUICKFIX: Run one of these in PowerShell 7 to update automatically:
+- Claude Code:    Register-PwshToClaudeCode
+- Claude Desktop: Register-PwshToClaudeDesktop
+
+Or manually: Run 'Get-MCPProxyPath -Escape' to get the path for JSON configuration.
+
+Please provide how to update the MCP client configuration to the user.";
+                }
+                else
+                {
+                    message =
+$@"PowerShell MCP Configuration Error
+
+ISSUE: PowerShell.MCP.Proxy version is outdated.
+- PowerShell.MCP module version: {MCPModuleInitializer.ServerVersion}
+- Proxy executable version: {proxyVersion}
+
+ACTION REQUIRED: Update your MCP client configuration
+- Executable path: {proxyExePath}
+
+QUICKFIX: Run one of these in PowerShell 7 to update automatically:
+- Claude Code:    Register-PwshToClaudeCode
+- Claude Desktop: Register-PwshToClaudeDesktop
+
+Or manually: Run 'Get-MCPProxyPath' to get the path for MCP client configuration.
+
+Please provide how to update the MCP client configuration to the user.";
+                }
+
+                var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+                var versionErrorResponse = JsonSerializer.Serialize(new
+                {
+                    status = "error",
+                    pid,
+                    error = "version_mismatch",
+                    message
+                });
+                await SendMessageAsync(pipeServer, versionErrorResponse, cancellationToken);
+                return;
+            }
+
+            // Check execution state
+            if (ExecutionState.Status == "busy")
+            {
+                // Mark that the running command's output should be cached
+                // (because Proxy won't receive it - it's sending a new request)
+                ExecutionState.MarkForCaching();
+
+                // Return busy response as JSON
+                var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+                var elapsed = ExecutionState.ElapsedSeconds;
+                var runningPipeline = TruncatePipeline(ExecutionState.CurrentPipeline);
+                // PSDrive cwd from the runspace's home thread (cached by
+                // MCPPollingEngine's timer tick). The runspace is busy
+                // with another command, so we read the cached value
+                // instead of touching SessionState directly. Proxy uses
+                // this to spawn the auto-route console at the source's
+                // cwd so the re-routed pipeline runs where the AI
+                // expected it. Falls back to process cwd before the
+                // first heartbeat (won't happen in practice once the
+                // module is loaded).
+                string? cwd;
+                try { cwd = ExecutionState.CurrentAiCwd ?? System.IO.Directory.GetCurrentDirectory(); }
+                catch { cwd = null; }
+                var busyResponse = JsonSerializer.Serialize(new
+                {
+                    pid,
+                    status = "busy",
+                    reason = "mcp_command",
+                    pipeline = runningPipeline,
+                    duration = Math.Round(elapsed, 2),
+                    cwd
+                });
+
+                await SendMessageAsync(pipeServer, busyResponse, cancellationToken);
+                return;
+            }
+
+            // Execute tool with state management for execute_command
+            if (name == "execute_command")
+            {
+                var pipeline = requestRoot.TryGetProperty("pipeline", out var pipelineElement)
+                    ? pipelineElement.GetString() ?? "" : "";
+
+                // Engine not running (startup blocked, e.g. AMSI/AV false
+                // positive). Fast-fail with guidance instead of stashing the
+                // command and blocking until the full timeout — without the
+                // polling engine nothing would ever consume it. Mirrors the
+                // normal success envelope so the proxy renders the body as-is,
+                // no new error contract required.
+                if (!MCPModuleInitializer.EngineReady)
+                {
+                    var pidNotReady = Process.GetCurrentProcess().Id;
+                    var notReadyHeader = JsonSerializer.Serialize(new
+                    {
+                        pid = pidNotReady,
+                        status = "success",
+                        pipeline = TruncatePipeline(pipeline),
+                        duration = 0.0
+                    });
+                    await SendMessageAsync(pipeServer, notReadyHeader + "\n\n" + MCPModuleInitializer.GetEngineNotReadyMessage(), cancellationToken);
+                    return;
+                }
+
+                var cmdletWarning = BuildGetSetContentWarning(pipeline);
+
+                // Wait for heartbeat to confirm runspace is available
+                if (!ExecutionState.WaitForHeartbeat())
+                {
+                    // Runspace is busy with user command - return JSON response
+                    var pid = Process.GetCurrentProcess().Id;
+                    var userCmdElapsed = ExecutionState.UserCommandElapsedSeconds;
+                    // Capture the source console's cwd so the proxy can
+                    // spawn the auto-route console at the same location
+                    // (see the mcp_command branch above for the reasoning).
+                    string? cwd;
+                    try { cwd = ExecutionState.CurrentAiCwd ?? System.IO.Directory.GetCurrentDirectory(); }
+                    catch { cwd = null; }
+                    var busyResponse = JsonSerializer.Serialize(new
+                    {
+                        pid,
+                        status = "busy",
+                        reason = "user_command",
+                        pipeline = "(user command)",
+                        duration = Math.Round(userCmdElapsed, 2),
+                        cwd
+                    });
+                    await SendMessageAsync(pipeServer, busyResponse, cancellationToken);
+                    return;
+                }
+
+                ExecutionState.SetBusy(pipeline);
+
+                try
+                {
+                    var (isTimeout, shouldCache, awaitingInput, promptText) = await Task.Run(() => ExecuteCommandRequest(requestRoot));
+
+                    var pid = Process.GetCurrentProcess().Id;
+                    var elapsed = ExecutionState.ElapsedSeconds;
+                    var runningPipeline = TruncatePipeline(pipeline);
+                    var roundedDuration = Math.Round(elapsed, 2);
+
+                    // Snapshot the post-execution cwd so the proxy can update its
+                    // LastAiCwd cache without an extra get_status round-trip. Reads
+                    // the PSDrive $PWD path cached by MCPPollingEngine's timer tick
+                    // — Set-Location updates $PWD but does NOT update process cwd
+                    // for PowerShell-managed providers, so Directory.GetCurrentDirectory()
+                    // would silently lie and pin LastAiCwd to startup dir forever.
+                    string? cwd;
+                    try { cwd = ExecutionState.CurrentAiCwd ?? System.IO.Directory.GetCurrentDirectory(); }
+                    catch { cwd = null; }
+
+                    if (awaitingInput)
+                    {
+                        // Prompt detected - the command is paused waiting for
+                        // interactive input. Hand control back to the AI now
+                        // (the command stays blocked; result is cached). The
+                        // proxy turns this into a "answer it or close it" notice.
+                        var promptInfo = string.IsNullOrEmpty(promptText) ? "" : $" ({promptText})";
+                        var statusLine = BuildStatusLine("⌨", $"Console is waiting for input{promptInfo}", "AwaitingInput", runningPipeline, roundedDuration);
+                        var awaitingResponse = JsonSerializer.Serialize(new
+                        {
+                            pid,
+                            status = "awaiting_input",
+                            pipeline = runningPipeline,
+                            duration = roundedDuration,
+                            message = promptText,
+                            statusLine,
+                            cwd
+                        });
+                        try
+                        {
+                            await SendMessageAsync(pipeServer, awaitingResponse, cancellationToken);
+                        }
+                        catch
+                        {
+                            // Pipe error - nothing to do
+                        }
+                    }
+                    else if (isTimeout)
+                    {
+                        // Timeout - send JSON response.
+                        //
+                        // A timeout is the only moment this is worth checking, and
+                        // the only moment it can be told apart from ordinary
+                        // slowness: if a child of this console is sitting at zero
+                        // CPU waiting on console input, the command is not slow,
+                        // it is queued behind the prompt's read and will never
+                        // return. Naming it here is what stops that from being
+                        // mistaken for the child's own fault — see StalledChild.
+                        var stalledChild = StalledChild.Describe();
+                        var statusLine = BuildStatusLine("⧗", "Pipeline is still running", "Busy", runningPipeline, roundedDuration);
+                        var timeoutResponse = JsonSerializer.Serialize(new
+                        {
+                            pid,
+                            status = "timeout",
+                            pipeline = runningPipeline,
+                            duration = roundedDuration,
+                            statusLine,
+                            warning = cmdletWarning,
+                            stalledChild,
+                            cwd
+                        });
+                        try
+                        {
+                            await SendMessageAsync(pipeServer, timeoutResponse, cancellationToken);
+                        }
+                        catch
+                        {
+                            // Pipe error on timeout - nothing to do
+                        }
+                    }
+                    else if (shouldCache)
+                    {
+                        // Result cached - MCP client disconnected, will be returned on next tool call
+                        var statusLine = BuildStatusLine("✓", "Pipeline executed successfully", "Completed", runningPipeline, roundedDuration);
+                        var cachedResponse = JsonSerializer.Serialize(new
+                        {
+                            pid,
+                            status = "completed",
+                            pipeline = runningPipeline,
+                            duration = roundedDuration,
+                            statusLine,
+                            warning = cmdletWarning,
+                            cwd
+                        });
+                        try
+                        {
+                            await SendMessageAsync(pipeServer, cachedResponse, cancellationToken);
+                        }
+                        catch
+                        {
+                            // Pipe error - result already cached, ignore
+                        }
+                    }
+                    else
+                    {
+                        // Normal completion - return header JSON + blank line + body
+                        var outputs = ExecutionState.ConsumeCachedOutputs();
+                        var resultText = string.Join("\n\n", outputs);
+                        if (cmdletWarning != null)
+                            resultText += "\n\n" + cmdletWarning;
+                        var header = JsonSerializer.Serialize(new
+                        {
+                            pid,
+                            status = "success",
+                            pipeline = runningPipeline,
+                            duration = Math.Round(elapsed, 2),
+                            cwd
+                        });
+                        var response = header + "\n\n" + resultText;
+                        try
+                        {
+                            await SendMessageAsync(pipeServer, response, cancellationToken);
+                        }
+                        catch
+                        {
+                            // Pipe error - save result to cache for next request
+                            ExecutionState.AddToCache(resultText);
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    ExecutionState.CompleteExecution();
+                    throw;
+                }
+            }
+            else
+            {
+                // Other tools (get_current_location) - consume cached outputs and prepend to result
+                var pid = Process.GetCurrentProcess().Id;
+                var result = await Task.Run(() => ExecuteTool(name!, requestRoot));
+
+                // Consume cached outputs and prepend (older first, then current result)
+                var cachedOutputs = ExecutionState.ConsumeCachedOutputs();
+                if (cachedOutputs.Count > 0)
+                {
+                    var combined = string.Join("\n\n", cachedOutputs);
+                    result = combined + "\n\n" + result;
+                }
+
+                var header = JsonSerializer.Serialize(new
+                {
+                    pid,
+                    status = "success"
+                });
+                await SendMessageAsync(pipeServer, header + "\n\n" + result, cancellationToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Send error response
+            var errorResponse = new
+            {
+                jsonrpc = "2.0",
+                id = (string?)null,
+                error = new
+                {
+                    code = -32603,
+                    message = "Internal error",
+                    data = ex.Message
+                }
+            };
+
+            var errorJson = JsonSerializer.Serialize(errorResponse, new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            });
+
+            try
+            {
+                await SendMessageAsync(pipeServer, errorJson, cancellationToken);
+            }
+            catch
+            {
+                // Give up if error response fails to send
+            }
+        }
+    }
+
+    /// <summary>
+    /// Executes a tool (except execute_command which is handled separately)
+    /// </summary>
+    private static string ExecuteTool(string method, JsonElement parameters)
+    {
+        return method switch
+        {
+            "get_current_location" => MCPModuleInitializer.GetCurrentLocation(),
+            "claim_console" => ClaimConsole(parameters),
+            "set_window_title" => SetWindowTitle(parameters),
+            "execute_silent" => ExecuteSilent(parameters),
+            _ => throw new ArgumentException($"Unknown method: {method}")
+        };
+    }
+    /// <summary>
+    /// Handles the claim_console command - claims this console for a proxy
+    /// </summary>
+    private static string ClaimConsole(JsonElement parameters)
+    {
+        var proxyPid = parameters.GetProperty("proxy_pid").GetInt32();
+        string? agentId = parameters.TryGetProperty("agent_id", out var agentIdElement)
+            ? agentIdElement.GetString() : null;
+        var newPipeName = MCPModuleInitializer.ClaimConsole(proxyPid, agentId);
+
+        if (newPipeName != null)
+        {
+            return $"{{\"success\":true,\"new_pipe_name\":\"{newPipeName}\"}}";
+        }
+        return "{\"success\":false,\"error\":\"Failed to claim console\"}";
+    }
+
+    /// <summary>
+    /// Handles the set_window_title command - sets the console window title silently
+    /// </summary>
+    private static string SetWindowTitle(JsonElement parameters)
+    {
+        try
+        {
+            var title = parameters.GetProperty("title").GetString() ?? "";
+            var escapedTitle = title.Replace("'", "''");
+            McpServerHost.ExecuteSilentCommand($"$Host.UI.RawUI.WindowTitle = '{escapedTitle}'");
+            return "{\"success\":true}";
+        }
+        catch (Exception ex)
+        {
+            return $"{{\"success\":false,\"error\":\"{ex.Message.Replace("\"", "\\\"")}\"}}";
+        }
+    }
+
+    /// <summary>
+    /// Handles the execute_silent command - executes a pipeline without echoing the command in the console
+    /// </summary>
+    private static string ExecuteSilent(JsonElement parameters)
+    {
+        try
+        {
+            var pipeline = parameters.GetProperty("pipeline").GetString() ?? "";
+            McpServerHost.ExecuteSilentCommand(pipeline);
+            return "{\"success\":true}";
+        }
+        catch (Exception ex)
+        {
+            return $"{{\"success\":false,\"error\":\"{ex.Message.Replace("\"", "\\\"")}\"}}";
+        }
+    }
+
+
+    /// <summary>
+    /// Executes the invokeExpression tool
+    /// </summary>
+    /// <returns>Tuple of (isTimeout, shouldCache, awaitingInput, promptText)</returns>
+    private static (bool isTimeout, bool shouldCache, bool awaitingInput, string? promptText) ExecuteCommandRequest(JsonElement parameters)
+    {
+        var pipeline = parameters.GetProperty("pipeline").GetString() ?? "";
+        var timeoutSeconds = parameters.TryGetProperty("timeout_seconds", out var timeoutElement)
+            ? timeoutElement.GetInt32()
+            : 170;
+
+        // Clamp to valid range
+        timeoutSeconds = Math.Clamp(timeoutSeconds, 0, 170);
+
+        // Extract variables if present
+        Dictionary<string, string>? variables = null;
+        if (parameters.TryGetProperty("variables", out var variablesElement) && variablesElement.ValueKind == JsonValueKind.Object)
+        {
+            variables = new Dictionary<string, string>();
+            foreach (var property in variablesElement.EnumerateObject())
+            {
+                variables[property.Name] = property.Value.GetString() ?? "";
+            }
+        }
+
+        return McpServerHost.ExecuteCommand(pipeline, variables, timeoutSeconds);
+    }
+
+
+
+    /// <summary>
+    /// Receives a message from Named Pipe
+    /// </summary>
+    private const int MaxMessageLength = 10 * 1024 * 1024; // 10 MB
+
+    private static async Task<string> ReceiveMessageAsync(NamedPipeServerStream pipeServer, CancellationToken cancellationToken)
+    {
+        // Receive message length (4 bytes)
+        var lengthBytes = new byte[4];
+        await ReadExactAsync(pipeServer, lengthBytes, cancellationToken);
+        var messageLength = BitConverter.ToInt32(lengthBytes, 0);
+
+        if (messageLength <= 0 || messageLength > MaxMessageLength)
+        {
+            throw new InvalidOperationException($"Invalid message length: {messageLength} (max {MaxMessageLength})");
+        }
+
+        // Receive message body
+        var messageBytes = new byte[messageLength];
+        await ReadExactAsync(pipeServer, messageBytes, cancellationToken);
+
+        return Encoding.UTF8.GetString(messageBytes);
+    }
+
+    /// <summary>
+    /// Sends a message to Named Pipe
+    /// </summary>
+    public static async Task SendMessageAsync(NamedPipeServerStream pipeServer, string message, CancellationToken cancellationToken)
+    {
+        var messageBytes = Encoding.UTF8.GetBytes(message);
+        var lengthBytes = BitConverter.GetBytes(messageBytes.Length);
+
+        // Send message length (4 bytes)
+        await pipeServer.WriteAsync(lengthBytes, 0, 4, cancellationToken);
+
+        // Send message body
+        await pipeServer.WriteAsync(messageBytes, 0, messageBytes.Length, cancellationToken);
+        await pipeServer.FlushAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Reads exactly the specified number of bytes
+    /// </summary>
+    private static async Task ReadExactAsync(NamedPipeServerStream stream, byte[] buffer, CancellationToken cancellationToken)
+    {
+        var totalBytesRead = 0;
+        while (totalBytesRead < buffer.Length)
+        {
+            var bytesRead = await stream.ReadAsync(buffer, totalBytesRead, buffer.Length - totalBytesRead, cancellationToken);
+            if (bytesRead == 0)
+            {
+                throw new IOException("Connection closed while reading data");
+            }
+            totalBytesRead += bytesRead;
+        }
+    }
+
+    /// <summary>
+    /// Returns a warning message if the pipeline uses Get-Content or Set-Content,
+    /// encouraging use of the optimized PowerShell.MCP text file cmdlets instead.
+    /// Returns null if no discouraged cmdlets are found.
+    /// </summary>
+    private static readonly Regex GetContentRegex = new(@"\b(Get-Content|gc|cat|type)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex SetContentRegex = new(@"\bSet-Content\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static string? BuildGetSetContentWarning(string pipeline)
+    {
+        var warnings = new List<string>();
+
+        if (GetContentRegex.IsMatch(pipeline))
+            warnings.Add("• Use Show-TextFiles instead of Get-Content (aliases: gc, cat, type)");
+
+        if (SetContentRegex.IsMatch(pipeline))
+            warnings.Add("• Use Update-MatchInFile, Update-LinesInFile, Add-LinesToFile, or Remove-LinesFromFile instead of Set-Content");
+
+        if (warnings.Count == 0) return null;
+
+        return "⚠️ Preferred cmdlets for PowerShell.MCP console:\n" + string.Join("\n", warnings);
+    }
+
+    /// <summary>
+    /// Truncates pipeline string for status display
+    /// </summary>
+    private static string TruncatePipeline(string pipeline)
+    {
+        if (string.IsNullOrEmpty(pipeline))
+            return "";
+
+        // Take first line
+        var firstLine = pipeline.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? pipeline;
+
+        // Take first pipe segment
+        var firstSegment = firstLine.Split('|').FirstOrDefault()?.Trim() ?? firstLine;
+
+        // Truncate if too long
+        const int maxLength = 30; // Max chars for status line display
+        if (firstSegment.Length > maxLength)
+            return firstSegment[..(maxLength - 3)] + "...";
+
+        // Add "..." if truncated by newline or pipe
+        if (firstSegment != pipeline)
+            return firstSegment + "...";
+
+        return firstSegment;
+    }
+
+
+    /// <summary>
+    /// Gets the current window title for status line display
+    /// </summary>
+    private static string GetWindowTitle()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            try { return Console.Title; }
+            catch { }
+        }
+        else
+        {
+            try
+            {
+                var result = McpServerHost.ExecuteSilentCommand("$Host.UI.RawUI.WindowTitle");
+                if (!string.IsNullOrEmpty(result))
+                    return result.Trim();
+            }
+            catch { }
+        }
+        return $"#{System.Diagnostics.Process.GetCurrentProcess().Id}";
+    }
+
+    /// <summary>
+    /// Builds a status line for MCP response display
+    /// </summary>
+    /// <param name="icon">Status icon (✓, ✗, ⧗)</param>
+    /// <param name="statusText">Description text (e.g., "Pipeline executed successfully")</param>
+    /// <param name="status">Status value (Ready, Busy, Completed)</param>
+    /// <param name="pipeline">Pipeline being executed (optional)</param>
+    /// <param name="duration">Execution duration in seconds (optional)</param>
+    private static string BuildStatusLine(string icon, string statusText, string status, string? pipeline = null, double? duration = null)
+    {
+        var windowTitle = GetWindowTitle();
+        var pipelineInfo = !string.IsNullOrEmpty(pipeline) ? $" | Pipeline: {pipeline}" : "";
+        var durationInfo = duration.HasValue ? $" | Duration: {duration:F2}s" : "";
+        return $"{icon} {statusText} | Window: {windowTitle} | Status: {status}{pipelineInfo}{durationInfo}";
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            _internalCancellation.Cancel();
+            _internalCancellation.Dispose();
+            _disposed = true;
+        }
+    }
+}
